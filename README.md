@@ -6,6 +6,12 @@
 本仓库（源码，你改这里）  ──deploy──▶  /etc/mihomo（部署产物，服务读这里）
 ```
 
+## 控制台
+
+![代理面板：手动选择 + 各机场自动测速组](image/首页.png)
+
+面板地址 `http://127.0.0.1:9090/ui`。`手动选择` 里点机场，各机场组（`P1-WD` … `P5-WD-2`）自己按延迟挑节点；`GLOBAL` 只在 `mode=global` 时才有意义。
+
 ## 一条铁律
 
 **改配置只改本仓库，永远不要手改 `/etc/mihomo`。**
@@ -22,6 +28,7 @@ mihomo-proxy/
 ├── README.md                    # 本文件
 ├── SKILL.md                     # 给 AI agent 的标准部署流程
 ├── subscriptions.list           # 【订阅清单】日常改这个
+├── image/                       # README 用的截图
 ├── pkg/
 │   └── mihomo-linux-amd64-v3-v1.19.33.deb   # 离线内核包
 └── config/                      # ← 整个目录会同步到 /etc/mihomo
