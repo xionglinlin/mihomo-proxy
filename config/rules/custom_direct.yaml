@@ -1,0 +1,29 @@
+# ============================================================================
+# 强制直连的域名（自定义规则集）
+# ----------------------------------------------------------------------------
+# 这里写的域名会走 DIRECT，无论它在不在地理库里、是不是国外域名。
+#
+# 语法（每行一条，不要加缩进之外的其它东西）：
+#   - DOMAIN-SUFFIX,example.com      example.com 及其所有子域名
+#   - DOMAIN,www.example.com         精确匹配这一个域名
+#   - DOMAIN-KEYWORD,example         域名里含 "example" 就命中
+#
+# 改完怎么生效（不用重启服务）：
+#   curl -X PUT http://127.0.0.1:9090/providers/rules/custom_direct
+#   想省事就 sudo systemctl restart mihomo
+#
+# 注意：这条规则集在 config.yaml 的 rules 里排在 GEOSITE,CN 之前，
+#       所以这里的直连优先级高于"地理库分类"。
+# ============================================================================
+
+payload:
+  - DOMAIN-SUFFIX,kkgithub.com
+  - DOMAIN-SUFFIX,justforlxz.com
+  - DOMAIN-SUFFIX,mkacg.com
+  - DOMAIN-SUFFIX,uniontech.com
+  - DOMAIN-SUFFIX,deepin.com
+  - DOMAIN-SUFFIX,deepin.org
+  - DOMAIN-SUFFIX,argotunnel.com
+  - DOMAIN-SUFFIX,sukaka.top
+  - DOMAIN-KEYWORD,tailscale
+  - DOMAIN-KEYWORD,discord

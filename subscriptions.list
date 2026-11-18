@@ -1,0 +1,9 @@
+# 订阅清单：  key | 名字 | 订阅URL | 模式(url-test|select)
+# ⚠ 本文件在公开仓库中是占位符（xxxx），部署前请填入你自己的订阅地址
+# 改完执行 ./mihomo-proxy deploy    （分隔符是竖线 |，两侧空格随意）
+# key 决定缓存文件名、节点前缀 [P1]、组名 P1-WD，分配后不要改
+proxy1 | WD | https://example.com/sub?token=xxxx | url-test
+proxy2 | 传家宝 | https://example.com/sub?token=xxxx | url-test
+proxy3 | 赔钱 | https://example.com/sub?token=xxxx | url-test
+proxy4 | 宝可梦 | https://example.com/sub?token=xxxx | url-test
+proxy5 | WD-2 | https://example.com/sub?token=xxxx | url-test

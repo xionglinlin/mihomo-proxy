@@ -1,0 +1,372 @@
+# ============================================================================
+# mihomo 手动选路版配置
+# ----------------------------------------------------------------------------
+# 设计目标：
+#   1. 四个订阅全部保留，节点合并进同一个列表，你自己手动挑
+#   2. 只保留一个策略组，没有地区分组、没有自动测速、没有嵌套
+#   3. 保留 Web UI 和 TUN，用法和原配置完全一致
+#
+# 启动方式（原 config.yaml 保持不动）：
+#   mihomo -d /etc/mihomo -f /etc/mihomo/config-manual.yaml
+#
+# 动作约定：浏览器打开 http://127.0.0.1:9090/ui ，在「手动选择」组里点节点
+# ============================================================================
+
+
+# ----------------------------------------------------------------------------
+# 1. 入口：程序怎么把流量交给 mihomo
+# ----------------------------------------------------------------------------
+# mixed-port：HTTP 代理 + SOCKS5 代理共用同一个端口，给"会自己配代理"的程序用
+# （浏览器、curl、git 等）。不写就默认 7890。
+mixed-port: 7890
+
+# 允许同一局域网的其它设备用本机当代理（手机、电视等）。不需要就改 false。
+allow-lan: true
+
+# IPv6 总开关。关掉会阻断所有 IPv6 连接，也屏蔽 AAAA 查询。
+ipv6: true
+
+# 日志级别：排查问题时改 debug，平时 info 就够，debug 会刷屏。
+log-level: info
+
+# 统一延迟：测速时剔除握手/加密耗时，只算"到目标的往返"，
+# 让不同协议、不同机场的节点延迟可以直接比较（url-test 择优更公平）。
+unified-delay: true
+
+
+# ----------------------------------------------------------------------------
+# 2. Web UI
+# ----------------------------------------------------------------------------
+# external-controller：RESTful API 的监听地址，Web UI 靠它工作。
+# 注意：冒号前不写 IP = 监听所有网卡且没有密码，局域网内任何人可控制代理。
+#      要更安全就改成 127.0.0.1:9090。
+external-controller: :9090
+
+# external-ui：面板静态文件目录，相对 /etc/mihomo（即已有的 ui/ 目录）。
+# 访问地址：http://127.0.0.1:9090/ui
+external-ui: ui
+
+
+# ----------------------------------------------------------------------------
+# 3. 记忆：让手动选择活过重启
+# ----------------------------------------------------------------------------
+profile:
+  # 记住你在面板里点选的节点。不加这条，每次重启都回到列表第一个。
+  store-selected: true
+  # 记住 fake-ip 的发号记录，重启后已有的连接不会因为"假 IP 认不出来"而断。
+  store-fake-ip: true
+
+
+# ----------------------------------------------------------------------------
+# 4. TUN 虚拟网卡：让不会配代理的程序也能走代理
+# ----------------------------------------------------------------------------
+# 原理：mihomo 建一块虚拟网卡并抢走默认路由，系统所有流量先经过它。
+tun:
+  enable: true
+  # 流量处理方式：
+  #   system  = 用内核协议栈，最快，推荐
+  #   gvisor  = 纯用户态实现，兼容性最好但明显更慢
+  #   mixed   = 两者混合
+  stack: system
+  # 自动改路由表，把默认路由指向虚拟网卡。没有它流量进不来。
+  auto-route: true
+  # 用 iptables 把已经建立的连接也重定向进网卡。
+  # 没有它：代理启动前就开着的程序（比如一直挂着的浏览器）会一直裸奔。
+  auto-redirect: true
+  # 自动探测物理网卡名，多网卡/切换 WiFi 时不用手改。
+  auto-detect-interface: true
+  # DNS 劫持：把发往 53 端口的查询全部强制交给 mihomo 内置 DNS。
+  dns-hijack:
+    - any:53
+    - tcp://any:53
+
+
+# ----------------------------------------------------------------------------
+# 5. DNS：规则能按域名分流的前提
+# ----------------------------------------------------------------------------
+# 核心逻辑：规则表里 GEOSITE/DOMAIN 这些条目要靠"域名"来判断，
+# 而虚拟网卡收到的只有 IP 包。fake-ip 就是让两者对上号的手段：
+#   应用问域名 → mihomo 先回一个 198.19.x.y 的假 IP 并记账
+#   → 应用拿着假 IP 来连接 → mihomo 查账本 → 知道是哪个域名了。
+dns:
+  enable: true
+  # 内置 DNS 自己的监听地址。配合上面的 dns-hijack 使用，
+  # 劫持来的查询会被转到这里，所以这个端口不用和 53 冲突。
+  listen: 0.0.0.0:1053
+  ipv6: true
+  enhanced-mode: fake-ip
+  # 假 IP 网段。必须和真实内网不冲突，198.19.0.0/16 是惯例做法。
+  fake-ip-range: 198.19.0.1/16
+  # 这些域名不用假 IP，走真实解析。
+  # 必要性：NTP 对时、局域网设备发现、音乐/游戏类 App 的连通性检测，
+  # 一旦用了假 IP 就会判定"网络异常"或连不上。
+  fake-ip-filter:
+    - '*.lan'
+    - '*.local'
+    - '*.localdomain'
+    - '*.home.arpa'
+    - 'time.*.com'
+    - 'ntp.*.com'
+    - '+.pool.ntp.org'
+    - '*.msftconnecttest.com'
+    - '*.msftncsi.com'
+    - 'stun.*.*'
+    - '+.music.163.com'
+    - '*.music.163.com'
+  # default-nameserver：只用来解析下面 nameserver 里出现的"域名形式"的服务器地址，
+  # 必须是纯 IP 形式，否则会自己解析自己，形成死循环。
+  # ⚠️ 必须用 853（DoT）而不是 53：TUN 把 any:53 全劫持回 mihomo 自己的 DNS，
+  #    写成 223.5.5.5 会形成「解析 DoH 服务器域名 → 被劫持回自己 → 又得解析」的死循环，
+  #    结果是所有节点 DNS 失败、全部超时。
+  default-nameserver:
+    - tls://223.5.5.5
+    - tls://223.6.6.6
+  # nameserver：需要真实解析时用谁。
+  # 这里是国内公共 DNS，走直连；DOH 形式可防污染但没走代理时不一定连得上。
+  nameserver:
+    - https://doh.pub/dns-query
+    - https://dns.alidns.com/dns-query
+  # nameserver-policy：指定域名用指定 DNS 解析，优先级高于上面。
+  # 公司内网域名必须用内网 DNS，否则解析成公网 IP 或者直接失败。
+  nameserver-policy:
+    "+.uniontech.com":
+      - "10.20.0.10"
+      - "10.8.0.10"
+    "+.deepin.org":
+      - "10.20.0.10"
+      - "10.8.0.10"
+    "+.deepin.com":
+      - "10.20.0.10"
+      - "10.8.0.10"
+
+
+# ----------------------------------------------------------------------------
+# 6. 订阅源（proxy-providers）：节点从哪来
+# ----------------------------------------------------------------------------
+# provider 不是节点，是"节点仓库"：从订阅地址拉一份节点清单存到本地 path 文件里，
+# 之后 mihomo 从文件读节点。拉取失败时继续用旧缓存，不会断网。
+#
+# override.additional-prefix 是必须的：不同机场的节点名经常撞车（都叫「香港01」），
+# 撞名后加载的会覆盖前面的，导致"某个订阅的节点看不见"。加前缀彻底隔开。
+# ==== BEGIN AUTOGEN: providers + groups ====
+# 本区段由 mihomo-proxy 从 subscriptions.list 生成，手改会被 deploy 覆盖。
+
+proxy-providers:
+  proxy1:
+    type: http
+    url: "https://example.com/sub?token=xxxx"
+    path: ./proxies/proxy1.yaml
+    interval: 3600
+    override:
+      additional-prefix: "[P1] "
+    health-check:
+      enable: true
+      interval: 300
+      url: http://www.gstatic.com/generate_204
+
+  proxy2:
+    type: http
+    url: "https://example.com/sub?token=xxxx"
+    path: ./proxies/proxy2.yaml
+    interval: 3600
+    override:
+      additional-prefix: "[P2] "
+    health-check:
+      enable: true
+      interval: 300
+      url: http://www.gstatic.com/generate_204
+
+  proxy3:
+    type: http
+    url: "https://example.com/sub?token=xxxx"
+    path: ./proxies/proxy3.yaml
+    interval: 3600
+    override:
+      additional-prefix: "[P3] "
+    health-check:
+      enable: true
+      interval: 300
+      url: http://www.gstatic.com/generate_204
+
+  proxy4:
+    type: http
+    url: "https://example.com/sub?token=xxxx"
+    path: ./proxies/proxy4.yaml
+    interval: 3600
+    override:
+      additional-prefix: "[P4] "
+    health-check:
+      enable: true
+      interval: 300
+      url: http://www.gstatic.com/generate_204
+
+  proxy5:
+    type: http
+    url: "https://example.com/sub?token=xxxx"
+    path: ./proxies/proxy5.yaml
+    interval: 3600
+    override:
+      additional-prefix: "[P5] "
+    health-check:
+      enable: true
+      interval: 300
+      url: http://www.gstatic.com/generate_204
+
+
+proxy-groups:
+  - name: 手动选择
+    type: select
+    proxies:
+      - P1-WD
+      - P2-传家宝
+      - P3-赔钱
+      - P4-宝可梦
+      - P5-WD-2
+
+  - name: P1-WD
+    type: url-test         # 自动挑该机场延迟最低的节点
+    use:
+      - proxy1
+    url: http://www.gstatic.com/generate_204
+    interval: 300          # 每 5 分钟重测一轮
+    tolerance: 50          # 延迟差 50ms 内不切换，避免来回抖
+    lazy: true             # 只有被选中时才测，省流量省 CPU
+    exclude-filter: "Traffic|Expire|剩余|到期|流量|官网|重置|建议|请切换"
+
+  - name: P2-传家宝
+    type: url-test         # 自动挑该机场延迟最低的节点
+    use:
+      - proxy2
+    url: http://www.gstatic.com/generate_204
+    interval: 300          # 每 5 分钟重测一轮
+    tolerance: 50          # 延迟差 50ms 内不切换，避免来回抖
+    lazy: true             # 只有被选中时才测，省流量省 CPU
+    exclude-filter: "Traffic|Expire|剩余|到期|流量|官网|重置|建议|请切换"
+
+  - name: P3-赔钱
+    type: url-test         # 自动挑该机场延迟最低的节点
+    use:
+      - proxy3
+    url: http://www.gstatic.com/generate_204
+    interval: 300          # 每 5 分钟重测一轮
+    tolerance: 50          # 延迟差 50ms 内不切换，避免来回抖
+    lazy: true             # 只有被选中时才测，省流量省 CPU
+    exclude-filter: "Traffic|Expire|剩余|到期|流量|官网|重置|建议|请切换"
+
+  - name: P4-宝可梦
+    type: url-test         # 自动挑该机场延迟最低的节点
+    use:
+      - proxy4
+    url: http://www.gstatic.com/generate_204
+    interval: 300          # 每 5 分钟重测一轮
+    tolerance: 50          # 延迟差 50ms 内不切换，避免来回抖
+    lazy: true             # 只有被选中时才测，省流量省 CPU
+    exclude-filter: "Traffic|Expire|剩余|到期|流量|官网|重置|建议|请切换"
+
+  - name: P5-WD-2
+    type: url-test         # 自动挑该机场延迟最低的节点
+    use:
+      - proxy5
+    url: http://www.gstatic.com/generate_204
+    interval: 300          # 每 5 分钟重测一轮
+    tolerance: 50          # 延迟差 50ms 内不切换，避免来回抖
+    lazy: true             # 只有被选中时才测，省流量省 CPU
+    exclude-filter: "Traffic|Expire|剩余|到期|流量|官网|重置|建议|请切换"
+
+  - name: 自动兜底
+    type: fallback         # 按下面的顺序试，前一个不通才换下一个
+    hidden: true           # 不在 UI 里占位置；启用后也能用
+    proxies:
+      - P1-WD
+      - P2-传家宝
+      - P3-赔钱
+      - P4-宝可梦
+      - P5-WD-2
+    url: http://www.gstatic.com/generate_204
+    interval: 300
+# ==== END AUTOGEN ====
+
+
+# ----------------------------------------------------------------------------
+# 7.5 自定义规则集（rule-providers）
+# ----------------------------------------------------------------------------
+# 把"自己维护的域名清单"放在独立文件里，以后加域名只改那个文件，不用动本文件。
+# 现在只接了一个「强制直连」清单，文件是 rules/custom_direct.yaml。
+#
+# type: file       = 读本地文件（另有一种 type: http 是定时下载远程规则集）
+# behavior: classical = 文件里每行写完整规则，如 - DOMAIN-SUFFIX,example.com
+#         （domain = 文件里只写裸域名；ipcidr = 只写 IP 段）
+#
+# 改了清单怎么生效：curl -X PUT http://127.0.0.1:9090/providers/rules/custom_direct
+rule-providers:
+  custom_direct:
+    type: file
+    behavior: classical
+    path: ./rules/custom_direct.yaml
+
+
+# ----------------------------------------------------------------------------
+# 8. 规则：从上往下匹配，第一条命中即停
+# ----------------------------------------------------------------------------
+rules:
+  # 局域网 IP 直连。no-resolve = 判断这条时不要去查 DNS，省一次往返。
+  - GEOIP,lan,DIRECT,no-resolve
+  # 自定义直连清单（rules/custom_direct.yaml）：优先级高于下面的地理库分类
+  - RULE-SET,custom_direct,DIRECT
+  # 国内域名直连（内置 geosite.dat 分类库，/etc/mihomo/geosite.dat 已有）
+  - GEOSITE,CN,DIRECT
+  # 国内 IP 直连（兜住只给 IP 不给域名的情况）
+  - GEOIP,CN,DIRECT
+  # 兜底：以上都不匹配 = 国外流量
+  # 二选一：默认走你手选的机场组；想让「机场全挂自动换下一个」生效，
+  # 就把下面两行的注释互换（或在终端执行 mihomo-proxy fallback on）
+  - MATCH,手动选择
+  # - MATCH,自动兜底
+
+
+# ----------------------------------------------------------------------------
+# 8.1 地理库：上面这些 GEOSITE / GEOIP 规则查的是什么表
+# ----------------------------------------------------------------------------
+# 规则里有两种"查表"判断，查的都是本地二进制库（编辑器打开是乱码，正常）：
+#   GEOSITE,CN      查 geosite.dat → 这个"域名"属于哪个分类（CN / google / telegram / category-ads-all…）
+#   GEOIP,CN        查 IP 库       → 这个"IP"属于哪个国家（当前用 Country.mmdb）
+#   GEOIP,lan       查 mihomo 内置的私有网段（10/8、172.16/12、192.168/16…），不读文件
+#
+# 三个库文件的分工：
+#   geosite.dat   域名分类库，GEOSITE 用。4MB
+#   Country.mmdb  IP→国家库（MaxMind MMDB 格式），GEOIP 用。10MB
+#   GeoIP.dat     IP→国家库（protobuf 格式），只有 geodata-mode: true 时才用；
+#                 当前没开这个开关，所以它是闲置文件，可以删
+#
+# 想确认某个域名在不在库里（只读查看，改不了也不该改）：
+#   strings /etc/mihomo/geosite.dat | grep uniontech
+# 想增删分流？不要动库，在上面 rules 里加 DOMAIN-SUFFIX，那才是正常做法。
+
+# ---- 方式一：自动更新（默认关闭）----------------------------------------
+# 打开后 mihomo 每 geo-update-interval 小时检查一次 geox-url，有新版本就下载覆盖。
+# 用法：把 geo-auto-update 改 true → sudo systemctl restart mihomo，之后不用管。
+# 代价：每次检查都要联网；库文件偶尔会有几十 MB 的下载。
+#
+# ⚠ geox-url 用的是 ghfast.top 镜像，因为 GitHub 直连在国内通常不通。
+#   你有直连能力就把 "https://ghfast.top/https://github.com/..." 换成 "https://github.com/..."
+geo-auto-update: false
+geo-update-interval: 24
+geox-url:
+  geosite: "https://ghfast.top/https://github.com/MetaCubeX/meta-rules-dat/releases/latest/download/geosite.dat"
+  mmdb: "https://ghfast.top/https://github.com/MetaCubeX/meta-rules-dat/releases/latest/download/country-lite.mmdb"
+  geoip: "https://ghfast.top/https://github.com/MetaCubeX/meta-rules-dat/releases/latest/download/geoip.dat"
+  asn: "https://ghfast.top/https://github.com/MetaCubeX/meta-rules-dat/releases/latest/download/GeoLite2-ASN.mmdb"
+
+# ---- 方式二：手动替换（自动更新关着时用，最可控）-------------------------
+# 在能上网的时候执行，curl 会走 TUN 自动出国，所以不需要额外的代理设置：
+#
+#   cd /etc/mihomo
+#   curl -fL -o geosite.dat  "https://ghfast.top/https://github.com/MetaCubeX/meta-rules-dat/releases/latest/download/geosite.dat"
+#   curl -fL -o Country.mmdb "https://ghfast.top/https://github.com/MetaCubeX/meta-rules-dat/releases/latest/download/country-lite.mmdb"
+#   mihomo -t -d /etc/mihomo          # 先校验，能加载再用
+#   sudo systemctl restart mihomo     # 库是启动时加载的，必须重启
+#
+# 注意：
+#   - 只改 geox-url 不会触发下载，那是"自动更新"才用的地址表
+#   - 下载回来的文件名要和配置一致：Country.mmdb（不是 country-lite.mmdb）
+#   - 换错了怎么办：/etc/mihomo 每次 deploy.sh 都有整目录备份，从备份里拷回来即可

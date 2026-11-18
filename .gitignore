@@ -1,0 +1,8 @@
+# 运行时产物
+config/cache.db
+config/proxies/*.yaml
+config/*.tmp
+*.tmp
+
+# 订阅缓存目录本身保留（deploy 会往里补种）
+!config/proxies/.gitkeep

@@ -1,0 +1,918 @@
+#!/usr/bin/env python3
+"""mihomo-proxy —— 部署 / 查询本机 mihomo（Clash.Meta）
+
+  ./mihomo-proxy deploy     部署或更新（幂等；需要 root 时自动提权）
+  ./mihomo-proxy restart    先检查，全部通过才强制重启服务
+  ./mihomo-proxy status     只读查询：内核/服务/漂移/订阅/分组/出口/备份
+  ./mihomo-proxy rollback [快照]  回滚到某份快照（省略参数 = 最近一份）
+  ./mihomo-proxy remove     卸载 mihomo 并回滚系统 DNS（会二次确认）
+
+源码（只有这里要改）：
+  subscriptions.list        订阅清单，一行一个订阅
+  config/config.yaml        运行配置，AUTOGEN 区由本工具渲染
+  config/rules/*.yaml       自定义规则集
+
+部署产物（不要手改）：
+  /etc/mihomo/              由 deploy 覆盖，服务从这里读配置
+
+调试用环境变量（日常不用设）：
+  MP_SRC   ／ MP_LIST   ／ MP_DST   ／ MP_API
+  MP_DST 指向非 /etc/mihomo 时进入沙箱模式：只做渲染/备份/拷贝，跳过装包、systemd、DNS
+"""
+
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+import urllib.request
+
+ROOT = os.path.dirname(os.path.realpath(__file__))
+SRC = os.environ.get("MP_SRC", os.path.join(ROOT, "config"))
+LIST = os.environ.get("MP_LIST", os.path.join(ROOT, "subscriptions.list"))
+DST = os.environ.get("MP_DST", "/etc/mihomo")
+API = os.environ.get("MP_API", "http://127.0.0.1:9090")
+SERVICE = "mihomo.service"
+KERNEL_VER = "v1.19.33"
+DEB_GLOB = "mihomo-linux-amd64-v3-"
+DEB_URL = ("https://github.com/MetaCubeX/mihomo/releases/download/{v}/"
+           "mihomo-linux-amd64-{v}-{v}.deb".format(v=KERNEL_VER))
+
+SANDBOX = DST != "/etc/mihomo"
+BEGIN = "# ==== BEGIN AUTOGEN: providers + groups ===="
+END = "# ==== END AUTOGEN ===="
+EXCLUDE = "Traffic|Expire|剩余|到期|流量|官网|重置|建议|请切换"
+HEALTH_URL = "http://www.gstatic.com/generate_204"
+MASTER = "手动选择"
+FALLBACK = "自动兜底"
+MODES = ("url-test", "select")
+MODE_DEFAULT = "url-test"
+KEEP_BACKUPS = 3
+
+problems = []
+
+
+# ------------------------------------------------------------------ 输出
+def say(msg):
+    print(f"\n==> {msg}")
+
+
+def ok(msg):
+    print(f"  [OK]   {msg}")
+
+
+def info(msg):
+    print(f"  ·      {msg}")
+
+
+def warn(msg):
+    print(f"  [WARN] {msg}")
+
+
+def fail(msg):
+    print(f"  [FAIL] {msg}")
+    problems.append(msg)
+
+
+def die(msg):
+    print(f"\n✗ {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+# ------------------------------------------------------------------ 提权
+def need_root(what):
+    """非 root 时用 sudo 重跑自己（保留参数）"""
+    if os.geteuid() == 0 or SANDBOX:
+        return
+    sudo = shutil.which("sudo")
+    if not sudo:
+        die(f"{what} 需要 root，但系统里没有 sudo")
+    print(f"· {what} 需要 root，正在提权 ...")
+    sys.stdout.flush()
+    args = [sudo]
+    if os.environ.get("SUDO_ASKPASS"):      # 无终端环境下用 askpass 助手读密码
+        args.append("-A")
+    os.execvp(sudo, args + [sys.executable, os.path.realpath(__file__)] + sys.argv[1:])
+
+
+def run(cmd, check=False):
+    r = subprocess.run(cmd, shell=isinstance(cmd, str), capture_output=True, text=True)
+    if check and r.returncode != 0:
+        raise RuntimeError(f"命令失败：{cmd}\n{(r.stdout + r.stderr).strip()[:400]}")
+    return r
+
+
+def mihomo_alive():
+    return run(["pgrep", "-x", "mihomo"]).returncode == 0
+
+
+def resolve_first(name):
+    """返回解析出的第一个地址（解析失败返回空串）；用于识别 fake-ip"""
+    for line in run(["getent", "ahosts", name]).stdout.splitlines():
+        parts = line.split()
+        if parts:
+            return parts[0]
+    return ""
+
+
+# ------------------------------------------------------------------ 清单
+def tag(key):
+    return key.replace("proxy", "P").upper() if key.startswith("proxy") else key.upper()
+
+
+def group_name(key, name):
+    return f"{tag(key)}-{name}"
+
+
+def read_list():
+    """subscriptions.list：key | 名字 | URL | 模式，| 前后空格随意，# 开头是注释"""
+    if not os.path.exists(LIST):
+        die(f"找不到订阅清单 {LIST}")
+    rows = []
+    for i, line in enumerate(open(LIST, encoding="utf-8"), 1):
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        parts = [p.strip() for p in s.split("|")]
+        if len(parts) == 3:      # key | 名字 | URL    （模式默认）
+            parts.append(MODE_DEFAULT)
+        if len(parts) != 4:
+            die(f"{LIST}:{i} 格式不对：应为「key | 名字 | 订阅URL | 模式」")
+        key, name, url, mode = parts
+        if mode not in MODES:
+            die(f"{LIST}:{i} 模式只能是 {' / '.join(MODES)}，收到 {mode!r}")
+        rows.append((key, name, url, mode))
+    if not rows:
+        die(f"{LIST} 里没有任何订阅")
+    keys = [r[0] for r in rows]
+    names = [r[1] for r in rows]
+    dup = {x for x in keys + names if (keys + names).count(x) > 1}
+    if dup:
+        die(f"清单里有重复：{', '.join(sorted(dup))}")
+    return rows
+
+
+# ------------------------------------------------------------------ 渲染
+def src_config():
+    path = os.path.join(SRC, "config.yaml")
+    if not os.path.exists(path):
+        die(f"找不到源配置 {path}")
+    return path
+
+
+def render(rows):
+    out = [BEGIN, "# 本区段由 mihomo-proxy 从 subscriptions.list 生成，手改会被 deploy 覆盖。", "",
+           "proxy-providers:"]
+    for key, name, url, _mode in rows:
+        out += [
+            f"  {key}:",
+            "    type: http",
+            f'    url: "{url}"',
+            f"    path: ./proxies/{key}.yaml",
+            "    interval: 3600",
+            "    override:",
+            f'      additional-prefix: "[{tag(key)}] "',
+            "    health-check:",
+            "      enable: true",
+            "      interval: 300",
+            f"      url: {HEALTH_URL}",
+            "",
+        ]
+    out += ["", "proxy-groups:",
+            f"  - name: {MASTER}", "    type: select", "    proxies:"]
+    out += [f"      - {group_name(key, name)}" for key, name, _, _ in rows]
+    for key, name, _, mode in rows:
+        out += ["", f"  - name: {group_name(key, name)}"]
+        if mode == "select":
+            out += ["    type: select           # 手动挑节点（自动测速不再覆盖你的选择）",
+                    "    use:",
+                    f"      - {key}"]
+        else:
+            out += ["    type: url-test         # 自动挑该机场延迟最低的节点",
+                    "    use:",
+                    f"      - {key}",
+                    f"    url: {HEALTH_URL}",
+                    "    interval: 300          # 每 5 分钟重测一轮",
+                    "    tolerance: 50          # 延迟差 50ms 内不切换，避免来回抖",
+                    "    lazy: true             # 只有被选中时才测，省流量省 CPU"]
+        out += [f'    exclude-filter: "{EXCLUDE}"']
+    out += ["", f"  - name: {FALLBACK}",
+            "    type: fallback         # 按下面的顺序试，前一个不通才换下一个",
+            "    hidden: true           # 不在 UI 里占位置；启用后也能用",
+            "    proxies:"]
+    out += [f"      - {group_name(key, name)}" for key, name, _, _ in rows]
+    out += [f"    url: {HEALTH_URL}", "    interval: 300", END]
+    return "\n".join(out)
+
+
+def render_config(rows):
+    """把清单写进源码 config.yaml 的 AUTOGEN 区，返回渲染后的全文"""
+    path = src_config()
+    text = open(path, encoding="utf-8").read()
+    if BEGIN not in text or END not in text:
+        die(f"{path} 缺少 AUTOGEN 标记，拒绝渲染（防止写坏配置）")
+    body = render(rows)
+    head = text[: text.index(BEGIN)]
+    tail = text[text.index(END) + len(END):]
+    merged = head + body + tail
+    with open(path, "w", encoding="utf-8") as f:   # 源码也要落盘，方便看/回滚
+        f.write(merged)
+    return merged
+
+
+def deploy_mode():
+    try:
+        mode = open(os.path.join(DST, ".deploy-mode"), encoding="utf-8").read().strip()
+    except OSError:
+        return None
+    return mode or None
+
+
+def normalized(text, mode):
+    if mode == "udcp":
+        return re.sub(r"^  listen: .*$", "  listen: 127.0.0.1:1053", text, flags=re.M)
+    if mode == "plain":
+        return re.sub(r"^  listen: .*$", "  listen: 0.0.0.0:53", text, flags=re.M)
+    return text
+
+
+def validate(path, datadir):
+    # mihomo -t 会在数据目录里写 cache.db；源码目录要保持干净，用完删掉
+    stray = os.path.join(datadir, "cache.db")
+    existed = os.path.exists(stray)
+    r = run(["mihomo", "-t", "-d", datadir, "-f", path])
+    if not existed and os.path.exists(stray):
+        os.remove(stray)
+    out = r.stdout + r.stderr
+    if "test is successful" not in out:
+        print(out.strip()[-900:])
+        return False
+    return True
+
+
+# ------------------------------------------------------------------ 内核
+def kernel_version():
+    exe = shutil.which("mihomo")
+    if not exe:
+        return None
+    r = run([exe, "-v"])
+    m = re.search(r"v\d+\.\d+\.\d+", r.stdout + r.stderr)
+    return m.group(0) if m else "unknown"
+
+
+def ensure_kernel():
+    say("内核")
+    have = kernel_version()
+    if have == KERNEL_VER:
+        ok(f"mihomo {have} 已安装，跳过")
+        return False
+    if SANDBOX:
+        warn(f"内核版本 {have or '未安装'}（沙箱模式，跳过安装）")
+        return False
+    if have:
+        info(f"已装 {have}，期望 {KERNEL_VER}，将覆盖安装")
+    deb = sorted([f for f in os.listdir(os.path.join(ROOT, "pkg"))
+                  if f.startswith(DEB_GLOB) and f.endswith(".deb")]) if os.path.isdir(
+                      os.path.join(ROOT, "pkg")) else []
+    need_root("安装内核")
+    if deb:
+        path = os.path.join(ROOT, "pkg", deb[-1])
+        info(f"使用本地包 {deb[-1]}")
+    else:
+        path = os.path.join("/tmp", os.path.basename(DEB_URL))
+        info("pkg/ 没有 deb，尝试从 GitHub 下载 ...")
+        if run(["curl", "-fL", "--retry", "2", "-o", path, DEB_URL]).returncode != 0:
+            die(f"下载失败。请在有网的机器下载后放到 {ROOT}/pkg/：\n  {DEB_URL}")
+    if run(["dpkg", "-i", path]).returncode != 0:
+        run("apt-get -f install -y", check=True)
+    have = kernel_version()
+    if have != KERNEL_VER:
+        die(f"内核安装后版本仍是 {have}，期望 {KERNEL_VER}")
+    ok(f"mihomo {have} 安装完成")
+    return True
+
+
+# ------------------------------------------------------------------ 备份 / 同步
+def stamp():
+    return time.strftime("%Y%m%d-%H%M%S")
+
+
+def snapshot(diffs):
+    """整目录快照：rename 到 /etc/mihomo.bak.<ts>，再从快照里捞回 cache.db 之外的东西用新配置覆盖"""
+    bak = f"{DST}.bak.{stamp()}"
+    if os.path.isdir(DST):
+        os.rename(DST, bak)
+        info(f"旧目录已快照：{bak}")
+        os.makedirs(DST)
+        for keep in ("cache.db", ".deploy-mode"):
+            src = os.path.join(bak, keep)
+            if os.path.exists(src):
+                shutil.copy2(src, os.path.join(DST, keep))
+                info(f"已保留 {keep}")
+    else:
+        os.makedirs(DST, exist_ok=True)
+        info(f"新建部署目录 {DST}")
+    olds = sorted([d for d in os.listdir(os.path.dirname(DST))
+                   if d.startswith(os.path.basename(DST) + ".bak.")])
+    for old in olds[:-KEEP_BACKUPS]:
+        shutil.rmtree(os.path.join(os.path.dirname(DST), old), ignore_errors=True)
+        info(f"清理旧快照 {old}")
+    return bak
+
+
+def same_file(a, b):
+    if not os.path.exists(a) or not os.path.exists(b):
+        return False
+    if os.path.getsize(a) != os.path.getsize(b):
+        return False
+    h = lambda p: hashlib.sha1(open(p, "rb").read()).hexdigest()
+    return h(a) == h(b)
+
+
+def collect_diffs(config_text):
+    """返回 (要覆盖的文件列表, config.yaml 是否有差异)"""
+    diffs = []
+    cfg_dst = os.path.join(DST, "config.yaml")
+    cfg_diff = True
+    if os.path.exists(cfg_dst):
+        cfg_diff = open(cfg_dst, encoding="utf-8").read() != config_text
+    for root, _dirs, files in os.walk(SRC):
+        if os.path.basename(root) == "proxies":
+            continue                       # 缓存单独处理，不覆盖
+        for f in files:
+            src = os.path.join(root, f)
+            rel = os.path.relpath(src, SRC)
+            if rel.endswith((".tmp", "cache.db")):
+                continue
+            if rel == "config.yaml":
+                continue
+            if not same_file(src, os.path.join(DST, rel)):
+                diffs.append(rel)
+    return diffs, cfg_diff
+
+
+def sync_tree(config_text, mode):
+    """把源码整棵树同步到部署目录（跳过未变化的文件），并写入渲染后的 config.yaml"""
+    copied = 0
+    for root, dirs, files in os.walk(SRC):
+        rel_root = os.path.relpath(root, SRC)
+        if rel_root == "proxies":
+            continue                      # 缓存单独处理
+        dst_root = DST if rel_root == "." else os.path.join(DST, rel_root)
+        os.makedirs(dst_root, exist_ok=True)
+        for f in files:
+            if f.endswith(".tmp") or f == "cache.db" or f == "config.yaml":
+                continue
+            src = os.path.join(root, f)
+            dst = os.path.join(dst_root, f)
+            if same_file(src, dst):
+                continue
+            shutil.copy2(src, dst)
+            copied += 1
+    path = os.path.join(DST, "config.yaml")
+    with open(path + ".tmp", "w", encoding="utf-8") as f:
+        f.write(config_text)
+    os.replace(path + ".tmp", path)
+    info(f"config.yaml 已写入；其余同步 {copied} 个文件")
+    if mode:
+        with open(os.path.join(DST, ".deploy-mode"), "w") as f:
+            f.write(mode + "\n")
+        info(f"部署模式记为 {mode}")
+    seeded = 0
+    os.makedirs(os.path.join(DST, "proxies"), exist_ok=True)
+    for f in sorted(os.listdir(os.path.join(SRC, "proxies"))):
+        if f.endswith(".yaml") and not os.path.exists(os.path.join(DST, "proxies", f)):
+            shutil.copy2(os.path.join(SRC, "proxies", f), os.path.join(DST, "proxies", f))
+            seeded += 1
+    if seeded:
+        info(f"补种 {seeded} 个订阅缓存")
+
+
+def rollback(bak):
+    """把部署目录换回快照"""
+    shutil.rmtree(DST, ignore_errors=True)
+    os.rename(bak, DST)
+    info(f"已回滚到快照 {bak}")
+
+
+def chown_back():
+    if SANDBOX or os.geteuid() != 0:
+        return
+    user = os.environ.get("SUDO_USER")
+    if user and user != "root":
+        gid = run(["id", "-gn", user]).stdout.strip()
+        run(["chown", "-R", f"{user}:{gid}", DST])
+        info(f"部署目录已归属 {user}（以后 deploy 不需要 root 的步骤更少）")
+
+
+# ------------------------------------------------------------------ DNS
+def deactivate_resolved_dropins():
+    for d in (f"/etc/systemd/resolved.conf.d/99-mihomo.conf",
+              f"/etc/systemd/system/systemd-resolved.service.d/after-mihomo.conf"):
+        if os.path.exists(d):
+            os.remove(d)
+    for d in ("/etc/systemd/resolved.conf.d", "/etc/systemd/system/systemd-resolved.service.d"):
+        try:
+            os.rmdir(d)
+        except OSError:
+            pass
+
+
+def setup_dns(mode):
+    say(f"DNS（{mode} 模式）")
+    if SANDBOX:
+        warn("沙箱模式，跳过 DNS 接管")
+        return
+    need_root("接管系统 DNS")
+    if mode == "udcp":
+        os.makedirs("/etc/systemd/resolved.conf.d", exist_ok=True)
+        open("/etc/systemd/resolved.conf.d/99-mihomo.conf", "w").write(
+            "[Resolve]\nDNS=127.0.0.1:1053\nFallbackDNS=223.5.5.5 119.29.29.29\n"
+            "Domains=~.\nDNSStubListener=yes\n")
+        os.makedirs("/etc/systemd/system/systemd-resolved.service.d", exist_ok=True)
+        open("/etc/systemd/system/systemd-resolved.service.d/after-mihomo.conf", "w").write(
+            "[Unit]\nAfter=mihomo.service\nWants=mihomo.service\n")
+        if not os.path.islink("/etc/resolv.conf") or \
+                os.path.realpath("/etc/resolv.conf") != "/run/systemd/resolve/stub-resolv.conf":
+            run(["ln", "-sf", "/run/systemd/resolve/stub-resolv.conf", "/etc/resolv.conf"])
+        run(["systemctl", "daemon-reload"])
+        run(["systemctl", "enable", "systemd-resolved"])
+        run(["systemctl", "restart", "systemd-resolved"])
+    else:
+        deactivate_resolved_dropins()
+        run(["systemctl", "daemon-reload"])
+        run(["systemctl", "disable", "--now", "systemd-resolved"])
+        try:
+            cur = open("/etc/resolv.conf", encoding="utf-8").read()
+        except OSError:
+            cur = ""
+        if "nameserver 127.0.0.1" not in cur:
+            run(["cp", "-a", "/etc/resolv.conf", f"/etc/resolv.conf.bak.{stamp()}"])
+            open("/etc/resolv.conf", "w").write("nameserver 127.0.0.1\n")
+    ok("DNS 已接管")
+
+
+def detect_mode():
+    if os.path.exists("/etc/systemd/resolved.conf.d/99-mihomo.conf"):
+        return "udcp"
+    if run(["dpkg", "-s", "udcp"]).returncode == 0:
+        return "udcp"
+    r = run(["iptables", "-S", "OUTPUT_UDCP"])
+    if "dport" in r.stdout and "-j DROP" in r.stdout:
+        return "udcp"
+    return "plain"
+
+
+# ------------------------------------------------------------------ 服务
+def service_active():
+    return run(["systemctl", "is-active", SERVICE]).stdout.strip() == "active"
+
+
+def reload_live(target):
+    req = urllib.request.Request(f"{API}/configs?force=true", method="PUT",
+                                 data=json.dumps({"path": target}).encode(),
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            return resp.status
+    except Exception as e:  # noqa: BLE001
+        info(f"热重载失败：{e}")
+        return None
+
+
+def ensure_enabled():
+    """删过服务后 unit 是 disabled 状态，deploy 要负责恢复开机自启"""
+    if SANDBOX:
+        return
+    if run(["systemctl", "is-enabled", SERVICE]).stdout.strip() == "enabled":
+        return
+    need_root(f"启用 {SERVICE}")
+    run(["systemctl", "enable", SERVICE])
+    info(f"{SERVICE} 已设为开机自启")
+
+
+def restart_service():
+    if SANDBOX:
+        warn("沙箱模式，跳过重启")
+        return True
+    need_root("重启服务")
+    r = run(["systemctl", "restart", SERVICE])
+    time.sleep(3)
+    return r.returncode == 0 and service_active()
+
+
+# ------------------------------------------------------------------ 自检
+def api_get(path, timeout=5):
+    try:
+        with urllib.request.urlopen(API + path, timeout=timeout) as r:
+            return json.load(r)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def self_check():
+    say("自检")
+    active = service_active()
+    (ok if active else fail)(f"服务 {SERVICE} 运行中")
+    ver = kernel_version()
+    (ok if ver == KERNEL_VER else fail)(f"内核版本 {ver or '未安装'}（期望 {KERNEL_VER}）")
+    (ok if api_get("/version") else fail)("API 9090 可访问")
+    ui = run(["curl", "-sf", "-m", "5", "-o", "/dev/null", API + "/ui/"]).returncode == 0
+    (ok if ui else fail)("Web UI /ui 可访问")
+    tun = run(["ip", "link", "show", "Meta"]).returncode == 0
+    (ok if tun else fail)("TUN 网卡 Meta 存在")
+    dns = run(["getent", "hosts", "www.baidu.com"]).returncode == 0
+    (ok if dns else fail)("DNS 解析 baidu 正常")
+    proxy = run(["curl", "-sf", "-m", "10", "-x", "http://127.0.0.1:7890",
+                 "-o", "/dev/null", "http://www.baidu.com"]).returncode == 0
+    (ok if proxy else fail)("HTTP 代理 7890 可用")
+    rules = api_get("/providers/rules")
+    custom = bool(rules and "custom_direct" in (rules.get("providers") or {}))
+    (ok if custom else fail)("自定义规则集 custom_direct 已加载")
+    return not problems
+
+
+# ------------------------------------------------------------------ 命令
+def cmd_deploy(force_restart=False):
+    say("1/8 环境检查")
+    arch = run(["uname", "-m"]).stdout.strip()
+    (ok if arch in ("x86_64", "amd64") else fail)(f"架构 {arch}")
+    if not os.path.exists("/proc/cpuinfo") or "avx2" not in open("/proc/cpuinfo").read():
+        warn("CPU 未检测到 AVX2，v3 内核可能无法运行")
+    for rel in ("config.yaml", "rules/custom_direct.yaml", "geosite.dat",
+                "Country.mmdb", "ui/index.html"):
+        p = os.path.join(SRC, rel)
+        (ok if os.path.exists(p) and os.path.getsize(p) > 0 else fail)(f"源码文件 {rel}")
+    if problems:
+        die("前置检查未通过，未做任何改动")
+
+    rows = read_list()
+    ok(f"订阅清单 {os.path.basename(LIST)}：{len(rows)} 个订阅")
+
+    installed = ensure_kernel()
+
+    say("2/8 渲染并校验配置")
+    text = render_config(rows)
+    if not validate(src_config(), SRC):
+        die("配置校验失败，**线上未做任何改动**")
+    ok("mihomo -t 通过")
+
+    mode = deploy_mode() or (None if SANDBOX else detect_mode())
+    text = normalized(text, mode)
+
+    say("3/8 比较差异")
+    diffs, cfg_diff = collect_diffs(text)
+    changed = cfg_diff or bool(diffs)
+    if not changed:
+        ok("源码与部署目录一致，无需推送")
+    else:
+        info(f"config.yaml 差异：{'有' if cfg_diff else '无'}")
+        if diffs:
+            info(f"其它差异 {len(diffs)} 个：{', '.join(diffs[:5])}" +
+                 (" ..." if len(diffs) > 5 else ""))
+
+    listen_changed = False
+    old_cfg = os.path.join(DST, "config.yaml")
+    if os.path.exists(old_cfg):
+        old_txt = open(old_cfg, encoding="utf-8").read()
+        o = re.search(r"^  listen: *(.*)$", old_txt, re.M)
+        n = re.search(r"^  listen: *(.*)$", text, re.M)
+        listen_changed = (o.group(1) if o else None) != (n.group(1) if n else None)
+        if listen_changed:
+            info(f"listen 变化：{o.group(1) if o else '无'} → {n.group(1) if n else '无'}")
+
+    if changed:
+        say("4/8 快照并同步")
+        need_root(f"写入 {DST}")
+        bak = snapshot(diffs)
+        sync_tree(text, mode)
+        if not validate(os.path.join(DST, "config.yaml"), DST):
+            rollback(bak)
+            die("部署后的配置校验失败，**已自动回滚**，服务仍在跑旧配置")
+        info(f"部署目录校验通过（{len(diffs) + (1 if cfg_diff else 0)} 个文件有变化）")
+        chown_back()
+        say("5/8 接管 DNS")
+        setup_dns(mode or "plain")
+    else:
+        say("4/8 快照并同步")
+        info("跳过（无差异）")
+
+    # 部署模式记录丢失时补回来（否则下次 status 会把 listen 差异误报成漂移）
+    if mode and not os.path.exists(os.path.join(DST, ".deploy-mode")):
+        need_root(f"写入 {DST}/.deploy-mode")
+        with open(os.path.join(DST, ".deploy-mode"), "w") as f:
+            f.write(mode + "\n")
+        info(f"部署模式补记为 {mode}")
+
+    say("6/8 生效")
+    if not SANDBOX:
+        ensure_enabled()
+    if SANDBOX:
+        info("沙箱模式，不触碰服务")
+    elif installed or listen_changed or not service_active():
+        if restart_service():
+            ok("服务已重启")
+        else:
+            fail("服务重启失败")
+    else:
+        code = reload_live(os.path.join(DST, "config.yaml"))
+        if code == 204:
+            ok("热重载完成（未断流）")
+        elif code is None and restart_service():
+            info("热重载不可用，已改用重启")
+            ok("服务已重启")
+        else:
+            fail("热重载与重启都失败")
+
+    if force_restart and not SANDBOX:
+        if restart_service():
+            ok("按要求强制重启完成")
+        else:
+            fail("强制重启失败")
+
+    say("7/8 自检")
+    passed = self_check()
+
+    say("8/8 结果")
+    if passed:
+        print(f"  部署成功。控制台 http://127.0.0.1:9090/ui")
+        print(f"  备份目录：{DST}.bak.*（保留最近 {KEEP_BACKUPS} 份）")
+        return 0
+    print("  自检存在问题，见上面 [FAIL] 项。")
+    print("  回滚：./mihomo-proxy rollback")
+    return 2
+
+
+def cmd_restart():
+    say("检查配置")
+    rows = read_list()
+    render_config(rows)
+    if not validate(src_config(), SRC):
+        die("配置校验失败，**未重启**；先修源码")
+    ok("mihomo -t 通过")
+    diffs, cfg_diff = collect_diffs(normalized(open(src_config(), encoding="utf-8").read(),
+                                              deploy_mode()))
+    if cfg_diff or diffs:
+        warn("源码与部署目录有差异，先跑一次 ./mihomo-proxy deploy 再重启更稳")
+    if SANDBOX:
+        info("沙箱模式，跳过重启")
+        return 0
+    if restart_service():
+        ok("服务已重启")
+        say("自检")
+        return 0 if self_check() else 2
+    fail("服务重启失败")
+    return 2
+
+
+def cmd_status():
+    ver = kernel_version()
+    active = service_active()
+    print(f"内核    mihomo {ver or '未安装'}（期望 {KERNEL_VER}，"
+          f"{'一致' if ver == KERNEL_VER else '不一致'}）")
+    if active:
+        since = run(["systemctl", "show", "-p", "ActiveEnterTimestamp", "--value", SERVICE]).stdout.strip()
+        enabled = run(["systemctl", "is-enabled", SERVICE]).stdout.strip()
+        print(f"服务    active（{since or '?'} 启动，{enabled}）")
+    else:
+        print("服务    未运行")
+    print(f"源码    {SRC}")
+    print(f"清单    {LIST}")
+
+    text = open(src_config(), encoding="utf-8").read()
+    want = normalized(text, deploy_mode())
+    deployed = os.path.join(DST, "config.yaml")
+    drift = []
+    if not os.path.exists(deployed):
+        drift.append("部署目录里没有 config.yaml")
+    elif open(deployed, encoding="utf-8").read() != want:
+        drift.append("config.yaml")
+    for root, _d, files in os.walk(SRC):
+        for f in files:
+            src = os.path.join(root, f)
+            rel = os.path.relpath(src, SRC)
+            if (rel.startswith("proxies/") or rel == "config.yaml"
+                    or rel.endswith((".tmp", "cache.db"))):
+                continue
+            if not same_file(src, os.path.join(DST, rel)):
+                drift.append(rel)
+    print(f"漂移    {'无' if not drift else '有 → ' + ', '.join(drift[:6])}")
+
+    providers = api_get("/providers/proxies") or {}
+    counts = {k: len(v.get("proxies") or [])
+              for k, v in (providers.get("providers") or {}).items()}
+    try:
+        rows = read_list()
+    except SystemExit:
+        rows = []
+    if rows:
+        print("订阅")
+        for key, name, _url, mode in rows:
+            print(f"        {key:<8}{group_name(key, name):<14}{mode:<10}"
+                  f"节点 {counts.get(key, '?')}")
+    groups = api_get("/proxies") or {}
+    names = [k for k, v in (groups.get("proxies") or {}).items() if v.get("all")]
+    if names:
+        master = (groups["proxies"].get(MASTER) or {}).get("now")
+        fb = FALLBACK in names
+        print(f"分组    {'、'.join(names)}")
+        state = "规则已指向（生效）" if _fb_on() else "未启用（组存在，规则未指向）"
+        print(f"        手动选择 → {master}；自动兜底 {state}")
+    rules = api_get("/providers/rules") or {}
+    for k, v in (rules.get("providers") or {}).items():
+        print(f"规则集  {k}：{v.get('ruleCount')} 条")
+
+    direct = run(["curl", "-sf", "-m", "8", "-o", "/dev/null", "http://www.baidu.com"]).returncode == 0
+    proxy = run(["curl", "-sf", "-m", "10", "-x", "http://127.0.0.1:7890",
+                 "-o", "/dev/null", "https://www.google.com/generate_204"]).returncode == 0
+    print(f"出口    直连 {'通' if direct else '不通'} ｜ 代理 {'通' if proxy else '不通'}")
+
+    baks = sorted([d for d in os.listdir(os.path.dirname(DST) or "/")
+                   if d.startswith(os.path.basename(DST) + ".bak.")])
+    if baks:
+        latest = os.path.join(os.path.dirname(DST), baks[-1])
+        print(f"备份    {len(baks)} 份，最近 {baks[-1]}")
+        print(f"        回滚：./mihomo-proxy rollback {latest}    （省略参数 = 最近一份）")
+    return 0
+
+
+def _fb_on():
+    for line in open(src_config(), encoding="utf-8"):
+        s = line.strip()
+        if s.startswith("#"):
+            continue
+        body = s.lstrip("- ").strip()
+        if body == f"MATCH,{FALLBACK}":
+            return True
+    return False
+
+
+def snapshots():
+    """返回 [(名字, 绝对路径)]，按时间升序"""
+    parent = os.path.dirname(DST) or "/"
+    base = os.path.basename(DST) + ".bak."
+    if not os.path.isdir(parent):
+        return []
+    return [(n, os.path.join(parent, n)) for n in sorted(os.listdir(parent)) if n.startswith(base)]
+
+
+def prune_snapshots(keep=KEEP_BACKUPS):
+    snaps = snapshots()
+    for name, path in snaps[:-keep]:
+        shutil.rmtree(path, ignore_errors=True)
+        info(f"清理旧快照 {name}")
+
+
+def cmd_rollback(target=""):
+    snaps = snapshots()
+    if target:
+        path = target if os.path.isabs(target) else os.path.join(os.path.dirname(DST) or "/", target)
+    elif snaps:
+        path = snaps[-1][1]
+    else:
+        die(f"没有可用快照（{DST}.bak.* 一个都没有）")
+    if not os.path.isdir(path):
+        die(f"找不到快照 {path}")
+    if not os.path.exists(os.path.join(path, "config.yaml")):
+        die(f"{path} 不像 mihomo 配置目录（里面没有 config.yaml）")
+    if os.path.realpath(path) == os.path.realpath(DST):
+        die("目标就是当前部署目录，无需回滚")
+
+    say(f"校验快照 {os.path.basename(path)}")
+    if not validate(os.path.join(path, "config.yaml"), path):
+        die("快照里的配置校验失败，**未做任何改动**")
+    ok("mihomo -t 通过")
+
+    need_root("回滚部署目录")
+    say("备份当前部署，再换回快照")
+    if os.path.isdir(DST):
+        current = f"{DST}.bak.{stamp()}"
+        os.rename(DST, current)
+        info(f"当前部署已存为 {os.path.basename(current)}（想反悔再 rollback 它）")
+    os.rename(path, DST)
+    ok(f"已回滚到 {os.path.basename(path)}")
+    prune_snapshots()
+    chown_back()
+
+    say("重启服务")
+    if restart_service():
+        ok("服务已重启")
+    else:
+        fail("服务重启失败")
+
+    say("自检")
+    passed = self_check()
+    if passed:
+        print("  回滚完成。控制台 http://127.0.0.1:9090/ui")
+        return 0
+    print("  回滚后自检仍有问题，可再回滚一份更早的快照：./mihomo-proxy rollback")
+    return 2
+
+
+def cmd_remove():
+    need_root("卸载")
+    say("将要删除以下内容")
+    items = [
+        f"停止并禁用服务 {SERVICE}",
+        "删除内核软件包（dpkg --purge mihomo）",
+        f"删除配置目录 {DST} 及所有备份 {DST}.bak.*",
+        "回滚 systemd-resolved 的 drop-in 与 /etc/resolv.conf",
+        "（不动）项目目录 " + ROOT,
+        "（不动）桌面代理设置 gsettings",
+    ]
+    for i, it in enumerate(items, 1):
+        print(f"  {i}. {it}")
+    print("\n输入 yes 确认执行（其它任意内容取消）：", end=" ")
+    try:
+        ans = input().strip()
+    except EOFError:
+        ans = ""
+    if ans != "yes":
+        print("已取消，未做任何改动")
+        return 1
+
+    say("停止服务")
+    run(["systemctl", "disable", "--now", SERVICE])
+    for _ in range(10):                       # dpkg 删文件不会杀进程，必须确认真的退出了
+        if not mihomo_alive():
+            break
+        time.sleep(1)
+    if mihomo_alive():
+        info("服务没有自行退出，强制结束进程")
+        run(["pkill", "-TERM", "-x", "mihomo"])
+        time.sleep(2)
+        if mihomo_alive():
+            run(["pkill", "-KILL", "-x", "mihomo"])
+            time.sleep(1)
+    if mihomo_alive():
+        fail("仍有 mihomo 进程在运行，卸载中止（请手动 pkill mihomo 后重试）")
+        return 2
+    ok("服务已停止，无残留进程")
+    say("卸载内核")
+    if run(["dpkg", "-s", "mihomo"]).returncode == 0:
+        run(["dpkg", "--purge", "mihomo"])
+        ok("内核已卸载")
+    else:
+        info("内核未安装，跳过")
+    say("删除配置")
+    parent = os.path.dirname(DST) or "/"
+    for d in [DST] + [os.path.join(parent, x) for x in os.listdir(parent)
+                      if x.startswith(os.path.basename(DST) + ".bak.")]:
+        if os.path.isdir(d):
+            shutil.rmtree(d, ignore_errors=True)
+            info(f"已删除 {d}")
+    say("回滚 DNS")
+    deactivate_resolved_dropins()
+    run(["systemctl", "daemon-reload"])
+    run(["systemctl", "enable", "systemd-resolved"])
+    run(["systemctl", "restart", "systemd-resolved"])
+    if os.path.exists("/run/systemd/resolve/stub-resolv.conf"):
+        run(["ln", "-sf", "/run/systemd/resolve/stub-resolv.conf", "/etc/resolv.conf"])
+    else:
+        open("/etc/resolv.conf", "w").write("nameserver 223.5.5.5\nnameserver 119.29.29.29\n")
+    ok("DNS 已回滚，桌面代理如需恢复：gsettings set org.gnome.system.proxy mode 'none'")
+    say("自检")
+    time.sleep(2)
+    resolved_ip = resolve_first("www.baidu.com")
+    fake = resolved_ip.startswith("198.19.") or resolved_ip.startswith("fdfe:")
+    if resolved_ip and not fake:
+        ok(f"DNS 恢复正常（www.baidu.com → {resolved_ip}）")
+    elif fake:
+        fail(f"DNS 仍在返回假 IP {resolved_ip}，说明还有代理在应答")
+    else:
+        fail("DNS 解析失败")
+    (ok if not mihomo_alive() else fail)("没有残留 mihomo 进程")
+    exe = shutil.which("mihomo")
+    (ok if not exe else fail)(f"内核已移除{'' if not exe else ' → ' + exe}")
+    (ok if not os.path.isdir(DST) else fail)(f"{DST} 已删除")
+    return 0 if not problems else 2
+
+
+def main():
+    argv = sys.argv[1:]
+    cmd = argv[0] if argv else ""
+    rest = argv[1:]
+    if cmd in ("", "-h", "--help", "help"):
+        print(__doc__)
+        return 0
+    if cmd == "deploy":
+        return cmd_deploy()
+    if cmd == "restart":
+        return cmd_restart()
+    if cmd == "status":
+        return cmd_status()
+    if cmd == "rollback":
+        return cmd_rollback(rest[0] if rest else "")
+    if cmd == "remove":
+        return cmd_remove()
+    die(f"未知命令 {cmd}，可用：deploy / restart / status / rollback / remove")
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except BrokenPipeError:          # 被 head/less 截断时安静退出
+        os._exit(0)
