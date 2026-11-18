@@ -28,7 +28,7 @@ mihomo-proxy/
     ├── config.yaml              # 运行配置（端口/DNS/TUN/规则），含详细注释
     ├── rules/
     │   └── custom_direct.yaml   # 【自定义直连清单】加直连域名改这个
-    ├── proxies/proxy1..5.yaml   # 订阅缓存（缺失时补种，不覆盖更新的）
+    ├── proxies/                 # 订阅缓存（运行时生成，不入库；deploy 只补种缺失的）
     ├── geosite.dat              # 域名分类库（GEOSITE 用）
     ├── Country.mmdb             # IP→国家库（GEOIP 用）
     └── ui/                      # 网页控制台静态文件
